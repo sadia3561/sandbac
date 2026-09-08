@@ -1,0 +1,210 @@
+{
+  "app_name": "SANDBAC",
+  "personality": "1 iOS-Native Clean",
+  "personality_one_liner": "A premium, trustworthy, and visually rich marketplace balancing the elegance of beauty services with the warmth of celebrations.",
+  "color": {
+    "surface": "#FFFFFF",
+    "onSurface": "#1A1A1A",
+    "surfaceSecondary": "#F8F8F7",
+    "onSurfaceSecondary": "#1C1C1E",
+    "surfaceTertiary": "#F0F0EE",
+    "onSurfaceTertiary": "#3A3A3C",
+    "surfaceInverse": "#1C1C1E",
+    "onSurfaceInverse": "#FFFFFF",
+    "brand": "#B04A5A",
+    "onBrand": "#FFFFFF",
+    "brandPrimary": "#C05364",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#F5D6DA",
+    "onBrandSecondary": "#B04A5A",
+    "brandTertiary": "#F9EBEB",
+    "onBrandTertiary": "#8A3845",
+    "success": "#34C759",
+    "onSuccess": "#FFFFFF",
+    "warning": "#FF9F0A",
+    "onWarning": "#FFFFFF",
+    "error": "#FF453A",
+    "onError": "#FFFFFF",
+    "info": "#64D2FF",
+    "onInfo": "#1C1C1E",
+    "border": "#E5E5E3",
+    "borderStrong": "#D1D1CE",
+    "divider": "#E5E5E3",
+    "muted": "#8E8E93"
+  },
+  "typography": {
+    "displayFontFamily": "Plus Jakarta Sans",
+    "textFontFamily": "Plus Jakarta Sans",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Use generous iOS-native padding. Group related elements with md (12pt) and separate sections with xl (24pt) or 2xl (32pt). Primary CTAs are sticky at the bottom with safe area clearance.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Apply frosted glass to the bottom tab bar, floating actions, and sticky headers.",
+      "Use glass on hero/featured category cards sitting over image backdrops.",
+      "Ensure strong readability by combining blur with a minimum 70% tint layer beneath foreground text."
+    ],
+    "dont's": [
+      "Do not use glass for standard list items, form inputs, or standard buttons."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Auth",
+      "purpose": "Seamless entry into the app with a focus on trust and speed.",
+      "states": {
+        "loading": "Centered brand spinner.",
+        "empty": "N/A",
+        "error": "Inline text or toast."
+      },
+      "layout": "Minimalist layout with a prominent brand logo, floating inputs, and a sticky 'Continue' button over the keyboard."
+    },
+    {
+      "name": "Onboarding (Location)",
+      "purpose": "Capture user location seamlessly to customize available services.",
+      "states": {
+        "loading": "Skeleton map.",
+        "empty": "N/A",
+        "error": "Message prompting manual address entry."
+      },
+      "layout": "Large map interface at the top, a clean search/autocomplete field in a bottom sheet, and quick select options (Home/Work)."
+    },
+    {
+      "name": "Home",
+      "purpose": "Gateway to all services, clearly splitting Beauty and Celebration.",
+      "states": {
+        "loading": "Skeleton cards.",
+        "empty": "N/A",
+        "error": "Retry connection button centered."
+      },
+      "layout": "Header with current location and profile avatar. A prominent search bar. Horizontal scroll sections for categories ('Beauty', 'Celebration'). High-quality image cards for 'Popular Services'. Glass bottom tab bar."
+    },
+    {
+      "name": "Category List",
+      "purpose": "Browse all services under a specific category.",
+      "states": {
+        "loading": "Skeleton list items.",
+        "empty": "Illustration + 'No services found' + 'Back Home'.",
+        "error": "Retry connection button."
+      },
+      "layout": "Sticky glass header with back button. Vertical list of service cards. Each card includes an image on the left, title, starting price, and a subtle 'Book' chevron/icon."
+    },
+    {
+      "name": "Service Detail",
+      "purpose": "Provide comprehensive details, packages, and pricing for a service.",
+      "states": {
+        "loading": "Hero image skeleton and content skeleton.",
+        "empty": "N/A",
+        "error": "Full screen error with retry button."
+      },
+      "layout": "Hero image with top-down gradient scrim (glass header over it). Content scrolls beneath. Sticky bottom CTA containing 'Starting at ₹XX' and a prominent 'Book Now' button."
+    },
+    {
+      "name": "Provider & Design Browse",
+      "purpose": "Allow users to pick specific designs or upload their own.",
+      "states": {
+        "loading": "Grid of skeleton boxes.",
+        "empty": "Illustration + 'No designs yet' + CTA to request custom.",
+        "error": "Retry connection."
+      },
+      "layout": "2-column Pinterest-style masonry or grid layout for designs. A floating action button (FAB) with glass effect to 'Upload Custom Design'."
+    },
+    {
+      "name": "Booking Flow",
+      "purpose": "Configure the where, when, and how of the service.",
+      "states": {
+        "loading": "Spinner during confirm.",
+        "empty": "N/A",
+        "error": "Toast on validation fail."
+      },
+      "layout": "Step-by-step or consolidated form. Segmented controls for ASAP vs Scheduled. Native date/time pickers. Sticky 'Confirm Booking' button at the bottom."
+    },
+    {
+      "name": "Bookings List",
+      "purpose": "Track current and past service requests.",
+      "states": {
+        "loading": "Skeleton rows.",
+        "empty": "Illustration + 'No bookings yet' + 'Explore Services' CTA.",
+        "error": "Retry connection button."
+      },
+      "layout": "Sticky header with Segmented tabs (Active, Upcoming, Completed). Clean card list detailing service, date, status pill (using status tokens), and provider."
+    },
+    {
+      "name": "Profile",
+      "purpose": "Manage user account, addresses, and settings.",
+      "states": {
+        "loading": "N/A",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Avatar and name at the top. Clean list rows for 'Saved Addresses', 'History', 'Support', and 'Logout' with right-pointing chevrons."
+    }
+  ],
+  "images": {
+    "category_beauty": {
+      "url": "https://images.unsplash.com/photo-1647004692483-c5d942fe1137?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwxfHxmYWNpYWwlMjBnbG93aW5nJTIwc2tpbiUyMGJlYXV0eSUyMHNhbG9ufGVufDB8fHx8MTc4ODg5MDYzOXww&ixlib=rb-4.1.0&q=85",
+      "alt": "A woman receiving a facial beauty treatment"
+    },
+    "category_mehndi": {
+      "url": "https://images.unsplash.com/photo-1732118400647-a81e3b37be87?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDF8MHwxfHNlYXJjaHwxfHxoZW5uYSUyMG1laG5kaSUyMGhhbmRzfGVufDB8fHx8MTc4ODg5MDYzOXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Hands beautifully decorated with henna mehndi"
+    },
+    "category_bridal": {
+      "url": "https://images.unsplash.com/photo-1610047614301-13c63f00c032?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2Mzl8MHwxfHNlYXJjaHwxfHxicmlkYWwlMjBtYWtldXAlMjB3ZWRkaW5nfGVufDB8fHx8MTc4ODg5MDYzOXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Stunning bridal makeup in traditional attire"
+    },
+    "category_birthday": {
+      "url": "https://images.unsplash.com/photo-1504196606672-aef5c9cefc92?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzZ8MHwxfHNlYXJjaHwxfHxiaXJ0aGRheSUyMHBhcnR5JTIwZGVjb3JhdGlvbiUyMGJhbGxvb25zfGVufDB8fHx8MTc4ODg5MDYzOXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Colorful birthday party balloons"
+    },
+    "category_anniversary": {
+      "url": "https://images.unsplash.com/photo-1612145463153-e97c1774fe2a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Nzd8MHwxfHNlYXJjaHwxfHxyb21hbnRpYyUyMGFubml2ZXJzYXJ5JTIwZGVjb3JhdGlvbiUyMHJvb218ZW58MHx8fHwxNzg4ODkwNjM5fDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Romantic anniversary decoration room setup"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Follow '1 iOS-Native Clean' personality guidelines: generous whitespace, high-quality images, and sticky primary actions above the bottom safe area.",
+    "Implement the 'gradient-to-dark scrim' for all images where text is overlaid (hero images on Service Details, Category headers). Set gradient stops: transparent at 0% to ≥70% surfaceInverse at 100%.",
+    "Implement Glassmorphism (blur over a 70%+ tint) strictly for: bottom tab bar, floating action buttons (FAB), and sticky headers during scroll.",
+    "Banned Colors Protocol: Under no circumstances should indigo, violet, blue, or purple be used in the UI. Stick strictly to the warm ruby/rose-gold brand palette.",
+    "Every primary button ('Book Now', 'Confirm') inside scrollable pages MUST be fixed at the bottom inside a non-scrolling container or bottom sheet.",
+    "For the booking flow, structurally separate 'Where/When' inputs from the 'Payment/Confirm' step based on mobbin research insights."
+  ]
+}
