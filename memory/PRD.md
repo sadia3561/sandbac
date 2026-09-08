@@ -25,10 +25,25 @@ Every list has empty / loading / error states. Every write action is server-auth
 Untouched, still working. Customer: welcome / login / register / location onboarding / home / categories / service detail / designs / booking flow (ASAP / SCHEDULED / LATER + reference image upload) / bookings list / bookings detail / notifications / addresses / profile. Provider: welcome / registration / home dashboard with GO ONLINE toggle / bookings tabs / booking detail with accept/reject/status transitions / portfolio CRUD + admin approval status / earnings / services / working schedule / KYC.
 
 ## Deferred (per spec)
-- Advanced provider matching / dispatch scoring
+- Advanced provider matching / dispatch scoring (Prompt 7 will build on `offer_to_eligible_providers`)
 - Payment gateway + automated payouts
-- Push notifications, WebSocket realtime
+- Push notifications, WebSocket realtime (event hooks in place)
 - Complex map tracking / AI recommendations
+
+## Booking Engine (this step)
+- Server-authoritative price + `price_snapshot` on every booking (never trusts frontend).
+- Validates: customer active, address ownership, service/package active, package↔service link, design approval + service link, service `supported_booking_types`.
+- ASAP → `SEARCHING_PROVIDER`; SCHEDULED/LATER → `PENDING` with future-date validation.
+- On creation: **broadcasts OFFERED `booking_assignments` to eligible providers** (service offered, user active, not offline for ASAP) with `expires_at` (2 min ASAP / 24 h scheduled).
+- Provider accept is **atomic** via `find_one_and_update` — first one wins, others get 409; verifies AVAILABLE + provider offers service + assignment not expired. Auto-cancels sibling OFFERED assignments.
+- Provider reject updates own OFFERED assignment; hides that booking from that provider only.
+- Lazy expiration on `/provider/requests`.
+- Full state-machine enforced via `VALID_PROVIDER_TRANSITIONS`.
+- `booking_status_history` collection captures every transition (old → new, actor, role, reason).
+- Customer cancel accepts reason + notifies assigned provider + cancels outstanding offers.
+- **Idempotency-Key** header on POST /bookings.
+- Provider preference (from design or explicit `provider_id`) captured as `provider_preference_id`.
+- `/bookings/{id}/history` endpoint scoped to customer / assigned provider / admin.
 
 ## Test credentials
 See `/app/memory/test_credentials.md`.

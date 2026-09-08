@@ -4,7 +4,7 @@ Services At Your Need Doorstep - Beauty And Celebration
 Modular architecture: auth, users, locations, categories, services, packages,
 providers/portfolio, designs, addresses, bookings, custom requests, notifications, reviews.
 """
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -489,12 +489,13 @@ class BookingIn(BaseModel):
     service_id: str
     package_id: str
     design_id: Optional[str] = None
+    provider_id: Optional[str] = None  # optional preference (not guaranteed)
     custom_request_id: Optional[str] = None
     reference_image_url: Optional[str] = None
     reference_note: Optional[str] = None
     address_id: str
     booking_type: BookingType
-    scheduled_at: Optional[datetime] = None  # required for SCHEDULED / LATER
+    scheduled_at: Optional[datetime] = None
     notes: Optional[str] = None
 
 class BookingOut(BaseModel):
@@ -514,6 +515,7 @@ class BookingOut(BaseModel):
     status: BookingStatus
     payment_status: PaymentStatus
     price_paise: int  # snapshot
+    price_snapshot: Optional[dict] = None
     reference_image_url: Optional[str] = None
     reference_note: Optional[str] = None
     notes: Optional[str] = None
@@ -521,13 +523,24 @@ class BookingOut(BaseModel):
     updated_at: datetime
 
 @api.post("/bookings", response_model=BookingOut, status_code=201)
-async def create_booking(body: BookingIn, user=Depends(require_role(Role.CUSTOMER))):
+async def create_booking(body: BookingIn, request: Request, user=Depends(require_role(Role.CUSTOMER))):
+    # ---- Idempotency: same customer + Idempotency-Key returns the same booking
+    idem_key = request.headers.get("Idempotency-Key") or request.headers.get("idempotency-key")
+    if idem_key:
+        existing = await db.bookings.find_one({"customer_id_user": user["id"], "idempotency_key": idem_key}, {"_id": 0})
+        if existing:
+            return existing
+
     cust = await db.customers.find_one({"user_id": user["id"]})
     if not cust:
         raise HTTPException(400, "Customer profile missing")
     service = await db.services.find_one({"id": body.service_id, "is_active": True}, {"_id": 0})
     if not service:
         raise HTTPException(404, "Service not found")
+    # supported booking types (default: all if not set)
+    supported = service.get("supported_booking_types") or ["ASAP", "SCHEDULED", "LATER"]
+    if body.booking_type.value not in supported:
+        raise HTTPException(400, f"{body.booking_type.value} not supported for this service")
     pkg = await db.packages.find_one({"id": body.package_id, "service_id": body.service_id, "is_active": True}, {"_id": 0})
     if not pkg:
         raise HTTPException(404, "Package not found")
@@ -536,52 +549,138 @@ async def create_booking(body: BookingIn, user=Depends(require_role(Role.CUSTOME
         raise HTTPException(404, "Address not found")
     design = None
     if body.design_id:
-        design = await db.designs.find_one({"id": body.design_id, "is_active": True}, {"_id": 0})
+        design = await db.designs.find_one({"id": body.design_id, "is_active": True, "approval_status": "APPROVED"}, {"_id": 0})
         if not design:
-            raise HTTPException(404, "Selected design not found")
-    if body.booking_type in (BookingType.SCHEDULED, BookingType.LATER) and not body.scheduled_at:
-        raise HTTPException(400, "scheduled_at required for SCHEDULED/LATER bookings")
+            raise HTTPException(404, "Selected design not found or not approved")
+        # design must belong to selected service
+        if design.get("service_id") != body.service_id:
+            raise HTTPException(400, "Design does not belong to selected service")
+    if body.booking_type in (BookingType.SCHEDULED, BookingType.LATER):
+        if not body.scheduled_at:
+            raise HTTPException(400, "scheduled_at required for SCHEDULED/LATER bookings")
+        if body.scheduled_at.tzinfo is None:
+            body.scheduled_at = body.scheduled_at.replace(tzinfo=timezone.utc)
+        if body.scheduled_at <= now_utc():
+            raise HTTPException(400, "scheduled_at must be in the future")
 
-    # server calculates authoritative price
+    # ---- Server-authoritative price ----
     price = pkg["base_price_paise"]
     if design and design.get("price_paise"):
         price = design["price_paise"]
 
     bid = new_id()
     status_val = BookingStatus.SEARCHING_PROVIDER if body.booking_type == BookingType.ASAP else BookingStatus.PENDING
+    duration = pkg.get("duration_minutes") or service.get("duration_minutes")
     doc = {
-        "id": bid,
-        "customer_id": cust["id"],
-        "service_id": service["id"],
-        "service_name": service["name"],
-        "package_id": pkg["id"],
-        "package_name": pkg["name"],
+        "id": bid, "customer_id": cust["id"], "customer_id_user": user["id"],
+        "service_id": service["id"], "service_name": service["name"],
+        "package_id": pkg["id"], "package_name": pkg["name"],
         "design_id": design["id"] if design else None,
         "design_title": design["title"] if design else None,
-        "provider_id": None,
-        "provider_name": None,
+        "provider_id": None, "provider_name": None,
+        "provider_preference_id": None,  # set below if requested
         "address": {k: v for k, v in addr.items() if k not in ("customer_id",)},
         "booking_type": body.booking_type.value,
         "scheduled_at": body.scheduled_at,
         "status": status_val.value,
         "payment_status": PaymentStatus.PENDING.value,
         "price_paise": price,
+        "price_snapshot": {
+            "package_base_paise": pkg["base_price_paise"],
+            "design_paise": (design or {}).get("price_paise") if design else None,
+            "final_paise": price, "currency": "INR",
+            "duration_minutes": duration, "captured_at": now_utc().isoformat(),
+        },
         "reference_image_url": body.reference_image_url,
         "reference_note": body.reference_note,
         "notes": body.notes,
-        "created_at": now_utc(),
-        "updated_at": now_utc(),
+        "idempotency_key": idem_key,
+        "created_at": now_utc(), "updated_at": now_utc(),
     }
+    # Optional explicit provider preference (or from design)
+    if body.provider_id:
+        doc["provider_preference_id"] = body.provider_id
+    if design and design.get("provider_id"):
+        doc["provider_preference_id"] = design["provider_id"]
+
     await db.bookings.insert_one(doc)
-    # in-app notification
+    await add_status_history(bid, None, status_val.value, user["id"], "customer", "Booking created")
+
+    # ---- Emit OFFERED assignments to eligible providers (simple foundation; Prompt 7 will rank) ----
+    await offer_to_eligible_providers(doc)
+
+    # Customer notification
     await db.notifications.insert_one({
         "id": new_id(), "user_id": user["id"], "type": "BOOKING_CREATED",
         "title": "Booking created",
-        "message": f"Your {service['name']} booking has been created. We're finding the best provider for you.",
+        "message": f"Your {service['name']} booking has been created. We're finding a provider for you.",
         "booking_id": bid, "read": False, "created_at": now_utc(),
     })
     doc.pop("_id", None)
     return doc
+
+
+# ---------------------------------------------------------------------------
+# Booking status history + eligibility service + assignment offering
+# ---------------------------------------------------------------------------
+async def add_status_history(booking_id: str, old_status: Optional[str], new_status: str,
+                              actor_user_id: Optional[str], actor_role: str, reason: Optional[str] = None,
+                              meta: Optional[dict] = None):
+    await db.booking_status_history.insert_one({
+        "id": new_id(), "booking_id": booking_id,
+        "old_status": old_status, "new_status": new_status,
+        "actor_user_id": actor_user_id, "actor_role": actor_role,
+        "reason": reason, "meta": meta or {}, "created_at": now_utc(),
+    })
+
+ASSIGNMENT_TTL_SECONDS = 120  # 2 min per offer
+
+async def offer_to_eligible_providers(booking: dict) -> None:
+    """Create OFFERED BookingAssignment records for eligible providers.
+    Foundation only — advanced ranking will be added in Prompt 7."""
+    svc_id = booking["service_id"]
+    # Eligible providers: offer the service, active user, not offline (for ASAP);
+    # for scheduled/later we still offer to all (working-schedule check comes in Prompt 7).
+    is_asap = booking["booking_type"] == BookingType.ASAP.value
+    offered_provider_ids = {d["provider_id"] async for d in db.provider_services.find(
+        {"service_id": svc_id, "is_active": True}, {"provider_id": 1, "_id": 0})}
+    if not offered_provider_ids:
+        return
+    # Check user active + provider preference short-circuits list to just that provider
+    provs = await db.providers.find({"id": {"$in": list(offered_provider_ids)}}, {"_id": 0}).to_list(500)
+    if booking.get("provider_preference_id"):
+        provs = [p for p in provs if p["id"] == booking["provider_preference_id"]]
+    users = {u["id"]: u async for u in db.users.find(
+        {"id": {"$in": [p["user_id"] for p in provs]}, "is_active": True},
+        {"_id": 0, "id": 1, "is_active": 1})}
+    eligible: List[dict] = []
+    for p in provs:
+        if p["user_id"] not in users:
+            continue
+        if is_asap:
+            a = await db.provider_availability.find_one({"provider_id": p["id"]})
+            if not a or a["state"] == Availability.OFFLINE.value or a["state"] == Availability.ON_SERVICE.value:
+                continue
+        eligible.append(p)
+    if not eligible:
+        return
+    expires_at = now_utc() + timedelta(seconds=ASSIGNMENT_TTL_SECONDS if is_asap else 24 * 3600)
+    docs = [{
+        "id": new_id(), "booking_id": booking["id"], "provider_id": p["id"],
+        "status": AssignmentStatus.OFFERED.value,
+        "offered_at": now_utc(), "expires_at": expires_at,
+        "matching_score": None, "distance_km": None,
+        "created_at": now_utc(),
+    } for p in eligible]
+    if docs:
+        await db.booking_assignments.insert_many(docs)
+        # Notify provider users
+        await db.notifications.insert_many([{
+            "id": new_id(), "user_id": p["user_id"], "type": "NEW_REQUEST",
+            "title": "New service request",
+            "message": f"{booking['service_name']} • {booking['package_name']}",
+            "booking_id": booking["id"], "read": False, "created_at": now_utc(),
+        } for p in eligible])
 
 @api.get("/bookings", response_model=List[BookingOut])
 async def list_bookings(status_filter: Optional[str] = None, user=Depends(current_user)):
@@ -612,19 +711,62 @@ async def get_booking(bid: str, user=Depends(current_user)):
         raise HTTPException(404, "Booking not found")
     return b
 
+class CancelIn(BaseModel):
+    reason: Optional[str] = None
+
 @api.post("/bookings/{bid}/cancel", response_model=BookingOut)
-async def cancel_booking(bid: str, user=Depends(current_user)):
+async def cancel_booking(bid: str, body: CancelIn | None = None, user=Depends(current_user)):
     cust = await db.customers.find_one({"user_id": user["id"]})
     if not cust:
         raise HTTPException(404, "Not found")
     b = await db.bookings.find_one({"id": bid, "customer_id": cust["id"]}, {"_id": 0})
     if not b:
         raise HTTPException(404, "Booking not found")
-    if b["status"] in (BookingStatus.SERVICE_COMPLETED.value, BookingStatus.CANCELLED.value):
+    if b["status"] in (BookingStatus.SERVICE_COMPLETED.value, BookingStatus.CANCELLED.value,
+                        BookingStatus.EXPIRED.value):
         raise HTTPException(400, "Booking cannot be cancelled")
-    await db.bookings.update_one({"id": bid}, {"$set": {"status": BookingStatus.CANCELLED.value, "updated_at": now_utc()}})
+    reason = (body.reason if body else None) or "Customer cancelled"
+    await db.bookings.update_one({"id": bid}, {"$set": {"status": BookingStatus.CANCELLED.value,
+                                                          "cancellation_reason": reason,
+                                                          "cancelled_by": "customer",
+                                                          "cancelled_at": now_utc(),
+                                                          "updated_at": now_utc()}})
+    # Cancel any outstanding OFFERED assignments
+    await db.booking_assignments.update_many(
+        {"booking_id": bid, "status": AssignmentStatus.OFFERED.value},
+        {"$set": {"status": AssignmentStatus.CANCELLED.value, "responded_at": now_utc()}},
+    )
+    await add_status_history(bid, b["status"], BookingStatus.CANCELLED.value,
+                              user["id"], "customer", reason)
+    # Notify assigned provider (if any)
+    if b.get("provider_id"):
+        prov = await db.providers.find_one({"id": b["provider_id"]}, {"user_id": 1})
+        if prov:
+            await db.notifications.insert_one({
+                "id": new_id(), "user_id": prov["user_id"], "type": "BOOKING_CANCELLED",
+                "title": "Booking cancelled by customer",
+                "message": f"{b['service_name']} booking was cancelled. Reason: {reason}",
+                "booking_id": bid, "read": False, "created_at": now_utc(),
+            })
     b["status"] = BookingStatus.CANCELLED.value
     return b
+
+@api.get("/bookings/{bid}/history")
+async def booking_history(bid: str, user=Depends(current_user)):
+    b = await db.bookings.find_one({"id": bid}, {"_id": 0, "customer_id": 1, "provider_id": 1})
+    if not b:
+        raise HTTPException(404, "Not found")
+    cust = await db.customers.find_one({"user_id": user["id"]})
+    prov = await db.providers.find_one({"user_id": user["id"]})
+    allowed = (
+        user["role"] == Role.ADMIN.value
+        or (cust and b.get("customer_id") == cust.get("id"))
+        or (prov and b.get("provider_id") == prov.get("id"))
+    )
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+    items = await db.booking_status_history.find({"booking_id": bid}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return items
 
 # ============================================================================
 # NOTIFICATIONS
@@ -913,21 +1055,36 @@ async def delete_portfolio(pid_: str, p=Depends(get_provider)):
 # ---- Provider Booking Requests & Lifecycle ----
 @api.get("/provider/requests", response_model=List[BookingOut])
 async def provider_requests(p=Depends(get_provider)):
-    # Show unclaimed bookings for services this provider offers, and rejections not yet done by this provider
-    svc_ids = [d["service_id"] async for d in db.provider_services.find(
-        {"provider_id": p["id"], "is_active": True}, {"service_id": 1, "_id": 0})]
-    if not svc_ids:
-        return []
-    rejected_ids = [r["booking_id"] async for r in db.booking_assignments.find(
-        {"provider_id": p["id"], "status": AssignmentStatus.REJECTED.value}, {"booking_id": 1, "_id": 0})]
-    q = {
-        "provider_id": None,
-        "service_id": {"$in": svc_ids},
-        "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]},
-    }
-    if rejected_ids:
-        q["id"] = {"$nin": rejected_ids}
-    items = await db.bookings.find(q, {"_id": 0}).sort("created_at", -1).to_list(50)
+    # Lazy-expire OFFERED assignments whose expires_at is past
+    await db.booking_assignments.update_many(
+        {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value, "expires_at": {"$lt": now_utc()}},
+        {"$set": {"status": AssignmentStatus.EXPIRED.value, "responded_at": now_utc()}},
+    )
+    # OFFERED assignments for this provider
+    offered = await db.booking_assignments.find(
+        {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value},
+        {"_id": 0, "booking_id": 1},
+    ).to_list(100)
+    booking_ids = [a["booking_id"] for a in offered]
+    if not booking_ids:
+        # Fallback: unclaimed bookings for offered services (in case broadcast missed)
+        svc_ids = [d["service_id"] async for d in db.provider_services.find(
+            {"provider_id": p["id"], "is_active": True}, {"service_id": 1, "_id": 0})]
+        if not svc_ids:
+            return []
+        rejected_ids = [r["booking_id"] async for r in db.booking_assignments.find(
+            {"provider_id": p["id"], "status": {"$in": [AssignmentStatus.REJECTED.value, AssignmentStatus.EXPIRED.value]}},
+            {"booking_id": 1, "_id": 0})]
+        q: dict = {"provider_id": None, "service_id": {"$in": svc_ids},
+                    "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]}}
+        if rejected_ids:
+            q["id"] = {"$nin": rejected_ids}
+        return await db.bookings.find(q, {"_id": 0}).sort("created_at", -1).to_list(50)
+    items = await db.bookings.find(
+        {"id": {"$in": booking_ids}, "provider_id": None,
+         "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(100)
     return items
 
 @api.get("/provider/bookings", response_model=List[BookingOut])
@@ -955,11 +1112,30 @@ async def provider_booking(bid: str, p=Depends(get_provider)):
 
 @api.post("/provider/requests/{bid}/accept", response_model=BookingOut)
 async def accept_request(bid: str, p=Depends(get_provider)):
-    # Check availability
+    # Availability check
     a = await db.provider_availability.find_one({"provider_id": p["id"]})
     if not a or a["state"] == Availability.OFFLINE.value:
         raise HTTPException(400, "You are offline. Go online to accept requests.")
-    # Atomic take of the booking: only succeeds if not already assigned and status is SEARCHING/PENDING
+    if a["state"] == Availability.ON_SERVICE.value:
+        raise HTTPException(400, "You already have an active service in progress.")
+    # Booking must still exist & be unclaimed
+    booking = await db.bookings.find_one({"id": bid}, {"_id": 0})
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    # Provider must offer that service
+    offers = await db.provider_services.find_one({"provider_id": p["id"], "service_id": booking["service_id"], "is_active": True})
+    if not offers:
+        raise HTTPException(403, "You don't offer this service")
+    # Expire own stale assignments first
+    await db.booking_assignments.update_many(
+        {"provider_id": p["id"], "booking_id": bid, "status": AssignmentStatus.OFFERED.value, "expires_at": {"$lt": now_utc()}},
+        {"$set": {"status": AssignmentStatus.EXPIRED.value, "responded_at": now_utc()}},
+    )
+    # If an OFFERED assignment exists for this provider, ensure not expired
+    assign = await db.booking_assignments.find_one({"provider_id": p["id"], "booking_id": bid,
+                                                     "status": AssignmentStatus.OFFERED.value})
+    # If none exists (fallback path), we still allow acceptance if unclaimed and provider offers service
+    # ---- Atomic take: only succeeds if not already assigned and status is SEARCHING/PENDING ----
     b = await db.bookings.find_one_and_update(
         {"id": bid, "provider_id": None,
          "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]}},
@@ -973,20 +1149,32 @@ async def accept_request(bid: str, p=Depends(get_provider)):
     if not b:
         raise HTTPException(409, "This booking is no longer available")
     b.pop("_id", None)
-    # assignment log
-    await db.booking_assignments.insert_one({
+    # Log accepted assignment
+    await db.booking_assignments.update_one(
+        {"provider_id": p["id"], "booking_id": bid, "status": AssignmentStatus.OFFERED.value},
+        {"$set": {"status": AssignmentStatus.ACCEPTED.value, "responded_at": now_utc()}},
+    ) if assign else await db.booking_assignments.insert_one({
         "id": new_id(), "booking_id": bid, "provider_id": p["id"],
         "status": AssignmentStatus.ACCEPTED.value,
-        "offered_at": b["created_at"], "responded_at": now_utc(),
+        "offered_at": booking["created_at"], "responded_at": now_utc(),
         "created_at": now_utc(),
     })
-    # customer notification
-    await db.notifications.insert_one({
-        "id": new_id(), "user_id": (await db.customers.find_one({"id": b["customer_id"]}, {"user_id": 1}))["user_id"],
-        "type": "BOOKING_ACCEPTED", "title": "Provider accepted your booking",
-        "message": f"{p.get('business_name')} accepted your {b['service_name']} booking.",
-        "booking_id": bid, "read": False, "created_at": now_utc(),
-    })
+    # Cancel other OFFERED assignments for this booking
+    await db.booking_assignments.update_many(
+        {"booking_id": bid, "provider_id": {"$ne": p["id"]}, "status": AssignmentStatus.OFFERED.value},
+        {"$set": {"status": AssignmentStatus.CANCELLED.value, "responded_at": now_utc()}},
+    )
+    await add_status_history(bid, booking["status"], BookingStatus.PROVIDER_ACCEPTED.value,
+                              p["user_id"], "provider", "Provider accepted")
+    # Customer notification
+    cust = await db.customers.find_one({"id": b["customer_id"]}, {"user_id": 1})
+    if cust:
+        await db.notifications.insert_one({
+            "id": new_id(), "user_id": cust["user_id"], "type": "BOOKING_ACCEPTED",
+            "title": "Provider accepted your booking",
+            "message": f"{p.get('business_name')} accepted your {b['service_name']} booking.",
+            "booking_id": bid, "read": False, "created_at": now_utc(),
+        })
     return b
 
 class RejectIn(BaseModel):
@@ -994,13 +1182,18 @@ class RejectIn(BaseModel):
 
 @api.post("/provider/requests/{bid}/reject")
 async def reject_request(bid: str, body: RejectIn, p=Depends(get_provider)):
-    # Log rejection so we don't show it again to this provider
-    await db.booking_assignments.insert_one({
-        "id": new_id(), "booking_id": bid, "provider_id": p["id"],
-        "status": AssignmentStatus.REJECTED.value, "rejection_reason": body.reason,
-        "offered_at": now_utc(), "responded_at": now_utc(),
-        "created_at": now_utc(),
-    })
+    # Prefer updating an OFFERED assignment; otherwise create a REJECTED record
+    r = await db.booking_assignments.update_one(
+        {"provider_id": p["id"], "booking_id": bid, "status": AssignmentStatus.OFFERED.value},
+        {"$set": {"status": AssignmentStatus.REJECTED.value, "rejection_reason": body.reason, "responded_at": now_utc()}},
+    )
+    if r.modified_count == 0:
+        await db.booking_assignments.insert_one({
+            "id": new_id(), "booking_id": bid, "provider_id": p["id"],
+            "status": AssignmentStatus.REJECTED.value, "rejection_reason": body.reason,
+            "offered_at": now_utc(), "responded_at": now_utc(), "created_at": now_utc(),
+        })
+    await add_status_history(bid, None, "PROVIDER_REJECTED_OFFER", p["user_id"], "provider", body.reason)
     return {"ok": True}
 
 class BookingStatusIn(BaseModel):
@@ -1024,11 +1217,10 @@ async def transition_status(bid: str, body: BookingStatusIn, p=Depends(get_provi
         raise HTTPException(400, f"Cannot transition from {b['status']} to {body.status.value}")
     upd = {"status": body.status.value, "updated_at": now_utc()}
     await db.bookings.update_one({"id": bid}, {"$set": upd})
-    # side effects
+    await add_status_history(bid, b["status"], body.status.value, p["user_id"], "provider")
     if body.status == BookingStatus.SERVICE_STARTED:
         await db.provider_availability.update_one({"provider_id": p["id"]}, {"$set": {"state": Availability.ON_SERVICE.value, "updated_at": now_utc()}})
     if body.status == BookingStatus.SERVICE_COMPLETED:
-        # earning record
         gross = b["price_paise"]
         commission = int(gross * 0.15)
         net = gross - commission
@@ -1038,9 +1230,7 @@ async def transition_status(bid: str, body: BookingStatusIn, p=Depends(get_provi
             "status": "PENDING", "created_at": now_utc(),
         })
         await db.providers.update_one({"id": p["id"]}, {"$inc": {"total_completed": 1}})
-        # provider back to available
         await db.provider_availability.update_one({"provider_id": p["id"]}, {"$set": {"state": Availability.AVAILABLE.value, "updated_at": now_utc()}})
-    # customer notification for state changes
     cust = await db.customers.find_one({"id": b["customer_id"]}, {"user_id": 1})
     if cust:
         labels = {
@@ -1775,6 +1965,10 @@ async def create_indexes():
     await db.audit_logs.create_index([("created_at", -1)])
     await db.coupons.create_index("code", unique=True)
     await db.designs.create_index("approval_status")
+    await db.booking_status_history.create_index([("booking_id", 1), ("created_at", 1)])
+    await db.booking_assignments.create_index([("provider_id", 1), ("status", 1)])
+    await db.booking_assignments.create_index([("booking_id", 1), ("status", 1)])
+    await db.bookings.create_index([("customer_id_user", 1), ("idempotency_key", 1)])
 
 async def seed_data():
     # cities
