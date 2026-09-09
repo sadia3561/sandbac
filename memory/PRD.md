@@ -25,10 +25,25 @@ Every list has empty / loading / error states. Every write action is server-auth
 Untouched, still working. Customer: welcome / login / register / location onboarding / home / categories / service detail / designs / booking flow (ASAP / SCHEDULED / LATER + reference image upload) / bookings list / bookings detail / notifications / addresses / profile. Provider: welcome / registration / home dashboard with GO ONLINE toggle / bookings tabs / booking detail with accept/reject/status transitions / portfolio CRUD + admin approval status / earnings / services / working schedule / KYC.
 
 ## Deferred (per spec)
-- Advanced provider matching / dispatch scoring (Prompt 7 will build on `offer_to_eligible_providers`)
 - Payment gateway + automated payouts
 - Push notifications, WebSocket realtime (event hooks in place)
-- Complex map tracking / AI recommendations
+- Complex map tracking / AI recommendations / image similarity
+
+## Smart Matching & Dispatch Engine (this step) — `/app/backend/matching.py`
+Three modular services on top of the booking engine:
+
+**ProviderEligibilityService** — filters + reasons for admin diagnostics.
+Reasons: `SERVICE_NOT_SUPPORTED`, `OUTSIDE_SERVICE_RADIUS`, `OUTSIDE_SERVICE_AREA`, `CURRENTLY_UNAVAILABLE`, `SCHEDULE_CONFLICT`, `EXISTING_BOOKING_CONFLICT`, `PROVIDER_INACTIVE`, `KYC_NOT_APPROVED`, `DESIGN_NOT_SUPPORTED`, `PROVIDER_PREFERENCE_UNAVAILABLE`. Uses Haversine distance from address lat/lng vs latest provider location (falls back to base) with per-provider `service_radius_km` (default 15 km).
+
+**ASAP** = provider must be currently `AVAILABLE`. **SCHEDULED / LATER** = ignores current online state and validates: day-of-week schedule match, time-in-window, and no overlap with existing PROVIDER_ACCEPTED → SERVICE_STARTED bookings (+30 min buffer).
+
+**ProviderScoringService** — normalised 0..1 factors combined with configurable weights (`WEIGHTS` dict): distance 0.35, rating 0.20, availability 0.10, service_match 0.05, area_match 0.05, design_match 0.05, preference 0.15, workload 0.05. Final 0..100 score. Rating is never the sole factor.
+
+**ProviderDispatchService** — Sequential dispatch: one OFFERED `BookingAssignment` at a time with per-offer TTL (90 s ASAP / 60 min scheduled). On reject / expiry the engine re-runs and dispatches to the next best. `run_matching(booking_id)` is idempotent (returns `OFFER_ACTIVE` if a live offer already exists; never creates duplicate active assignments). Design-tied-to-provider bookings are strict preferences: only that provider is eligible; no silent substitution. If no candidate remains → booking flagged with `no_provider_found`.
+
+Random tie-break on shuffle before deterministic score sort keeps fairness across similar providers.
+
+**Wired into**: `POST /api/bookings` (initial dispatch), `POST /api/provider/requests/{id}/reject` (immediate re-dispatch), `GET /api/provider/requests` (lazy expire + re-dispatch), plus new endpoints: `POST /api/bookings/{id}/match` (manual retry), `GET /api/bookings/{id}/matching-status`, `GET /api/admin/bookings/{id}/matching` (full ranked candidate list with reasons + assignment history for admin diagnostics).
 
 ## Booking Engine (this step)
 - Server-authoritative price + `price_snapshot` on every booking (never trusts frontend).

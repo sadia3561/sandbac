@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from enum import Enum
 import os, uuid, logging, jwt, hashlib, secrets
+from matching import MatchingEngine
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -30,6 +31,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "ChangeMe@Admin1")
 
 client = AsyncIOMotorClient(MONGO_URL, tz_aware=True)
 db = client[DB_NAME]
+matcher = MatchingEngine(db)
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 DUMMY_HASH = pwd_ctx.hash("dummy-timing-hash-value")
@@ -606,8 +608,8 @@ async def create_booking(body: BookingIn, request: Request, user=Depends(require
     await db.bookings.insert_one(doc)
     await add_status_history(bid, None, status_val.value, user["id"], "customer", "Booking created")
 
-    # ---- Emit OFFERED assignments to eligible providers (simple foundation; Prompt 7 will rank) ----
-    await offer_to_eligible_providers(doc)
+    # ---- Smart matching & dispatch (sequential, top-scored first) ----
+    await matcher.run_matching(bid)
 
     # Customer notification
     await db.notifications.insert_one({
@@ -767,6 +769,55 @@ async def booking_history(bid: str, user=Depends(current_user)):
         raise HTTPException(403, "Forbidden")
     items = await db.booking_status_history.find({"booking_id": bid}, {"_id": 0}).sort("created_at", 1).to_list(200)
     return items
+
+
+# ---------------------------------------------------------------------------
+# Matching engine endpoints
+# ---------------------------------------------------------------------------
+@api.post("/bookings/{bid}/match")
+async def trigger_match(bid: str, user=Depends(current_user)):
+    """Manual re-match trigger. Admin or booking's own customer can trigger."""
+    b = await db.bookings.find_one({"id": bid}, {"_id": 0, "customer_id": 1})
+    if not b:
+        raise HTTPException(404, "Booking not found")
+    cust = await db.customers.find_one({"user_id": user["id"]})
+    allowed = user["role"] == Role.ADMIN.value or (cust and b["customer_id"] == cust["id"])
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+    r = await matcher.run_matching(bid)
+    return r
+
+@api.get("/bookings/{bid}/matching-status")
+async def matching_status(bid: str, user=Depends(current_user)):
+    b = await db.bookings.find_one({"id": bid}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    cust = await db.customers.find_one({"user_id": user["id"]})
+    allowed = user["role"] == Role.ADMIN.value or (cust and b.get("customer_id") == cust["id"])
+    if not allowed:
+        raise HTTPException(403, "Forbidden")
+    # Live offer (if any)
+    live = await db.booking_assignments.find_one(
+        {"booking_id": bid, "status": "OFFERED", "expires_at": {"$gt": now_utc()}}, {"_id": 0}
+    )
+    total_assignments = await db.booking_assignments.count_documents({"booking_id": bid})
+    result = {
+        "booking_status": b["status"],
+        "assigned_provider_id": b.get("provider_id"),
+        "live_offer": live,
+        "total_offers": total_assignments,
+    }
+    return result
+
+@api.get("/admin/bookings/{bid}/matching")
+async def admin_matching_debug(bid: str, admin=Depends(require_role(Role.ADMIN))):
+    b = await db.bookings.find_one({"id": bid}, {"_id": 0})
+    if not b:
+        raise HTTPException(404, "Not found")
+    ranked = await matcher.rank(b)
+    assignments = await db.booking_assignments.find({"booking_id": bid}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return {"booking": b, "ranked_candidates": ranked, "assignments": assignments}
+
 
 # ============================================================================
 # NOTIFICATIONS
@@ -1055,31 +1106,31 @@ async def delete_portfolio(pid_: str, p=Depends(get_provider)):
 # ---- Provider Booking Requests & Lifecycle ----
 @api.get("/provider/requests", response_model=List[BookingOut])
 async def provider_requests(p=Depends(get_provider)):
-    # Lazy-expire OFFERED assignments whose expires_at is past
-    await db.booking_assignments.update_many(
+    # Lazy-expire OFFERED assignments whose expires_at is past AND trigger re-dispatch for those bookings
+    expired_cursor = db.booking_assignments.find(
         {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value, "expires_at": {"$lt": now_utc()}},
-        {"$set": {"status": AssignmentStatus.EXPIRED.value, "responded_at": now_utc()}},
+        {"_id": 0, "booking_id": 1},
     )
-    # OFFERED assignments for this provider
+    expired_bids: List[str] = []
+    async for x in expired_cursor:
+        expired_bids.append(x["booking_id"])
+    if expired_bids:
+        await db.booking_assignments.update_many(
+            {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value, "expires_at": {"$lt": now_utc()}},
+            {"$set": {"status": AssignmentStatus.EXPIRED.value, "responded_at": now_utc()}},
+        )
+        for bid_ in expired_bids:
+            try: await matcher.run_matching(bid_)
+            except Exception: pass
+    # OFFERED assignments live for this provider now
     offered = await db.booking_assignments.find(
-        {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value},
+        {"provider_id": p["id"], "status": AssignmentStatus.OFFERED.value,
+         "expires_at": {"$gt": now_utc()}},
         {"_id": 0, "booking_id": 1},
     ).to_list(100)
     booking_ids = [a["booking_id"] for a in offered]
     if not booking_ids:
-        # Fallback: unclaimed bookings for offered services (in case broadcast missed)
-        svc_ids = [d["service_id"] async for d in db.provider_services.find(
-            {"provider_id": p["id"], "is_active": True}, {"service_id": 1, "_id": 0})]
-        if not svc_ids:
-            return []
-        rejected_ids = [r["booking_id"] async for r in db.booking_assignments.find(
-            {"provider_id": p["id"], "status": {"$in": [AssignmentStatus.REJECTED.value, AssignmentStatus.EXPIRED.value]}},
-            {"booking_id": 1, "_id": 0})]
-        q: dict = {"provider_id": None, "service_id": {"$in": svc_ids},
-                    "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]}}
-        if rejected_ids:
-            q["id"] = {"$nin": rejected_ids}
-        return await db.bookings.find(q, {"_id": 0}).sort("created_at", -1).to_list(50)
+        return []
     items = await db.bookings.find(
         {"id": {"$in": booking_ids}, "provider_id": None,
          "status": {"$in": [BookingStatus.SEARCHING_PROVIDER.value, BookingStatus.PENDING.value]}},
@@ -1182,7 +1233,6 @@ class RejectIn(BaseModel):
 
 @api.post("/provider/requests/{bid}/reject")
 async def reject_request(bid: str, body: RejectIn, p=Depends(get_provider)):
-    # Prefer updating an OFFERED assignment; otherwise create a REJECTED record
     r = await db.booking_assignments.update_one(
         {"provider_id": p["id"], "booking_id": bid, "status": AssignmentStatus.OFFERED.value},
         {"$set": {"status": AssignmentStatus.REJECTED.value, "rejection_reason": body.reason, "responded_at": now_utc()}},
@@ -1194,6 +1244,8 @@ async def reject_request(bid: str, body: RejectIn, p=Depends(get_provider)):
             "offered_at": now_utc(), "responded_at": now_utc(), "created_at": now_utc(),
         })
     await add_status_history(bid, None, "PROVIDER_REJECTED_OFFER", p["user_id"], "provider", body.reason)
+    # Try to dispatch to next best eligible provider
+    await matcher.run_matching(bid)
     return {"ok": True}
 
 class BookingStatusIn(BaseModel):
