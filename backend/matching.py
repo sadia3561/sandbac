@@ -41,6 +41,7 @@ R_INACTIVE = "PROVIDER_INACTIVE"
 R_KYC = "KYC_NOT_APPROVED"
 R_DESIGN = "DESIGN_NOT_SUPPORTED"
 R_PREF_UNAVAIL = "PROVIDER_PREFERENCE_UNAVAILABLE"
+R_GENDER = "GENDER_RESTRICTION_MISMATCH"
 
 DISPATCH_TTL_ASAP_SEC = 90         # 90s per provider for ASAP
 DISPATCH_TTL_SCHEDULED_SEC = 3600  # 60min per provider for scheduled
@@ -111,13 +112,36 @@ class MatchingEngine:
 
     async def check_eligibility(self, provider: dict, user: dict, booking: dict) -> EligibilityResult:
         r = EligibilityResult(provider)
-        # Account / KYC
+        # Account status
         if not user or not user.get("is_active", True):
             r.reasons.append(R_INACTIVE)
             return r
-        # (KYC not blocking by default; require APPROVED only when configured)
-        if (booking.get("require_kyc") is True) and provider.get("kyc_status") != "APPROVED":
+
+        # ---------------------------------------------------------------
+        # KYC gate — MANDATORY for matching. A provider must have completed
+        # KYC (status == APPROVED) before receiving any booking offer.
+        # ---------------------------------------------------------------
+        if provider.get("kyc_status") != "APPROVED":
             r.reasons.append(R_KYC)
+
+        # ---------------------------------------------------------------
+        # Gender restriction — enforced from the SERVICE catalog.
+        #   FEMALE_ONLY  → only providers whose gender is FEMALE match.
+        #   MALE_ONLY    → only providers whose gender is MALE match.
+        #   NONE / null  → no restriction (e.g. Decoration / Celebration).
+        # The service document must carry `gender_restriction`. Missing
+        # values fall back to NONE for safety.
+        # ---------------------------------------------------------------
+        svc = await self.db.services.find_one(
+            {"id": booking["service_id"]},
+            {"_id": 0, "gender_restriction": 1},
+        )
+        restriction = (svc or {}).get("gender_restriction") or "NONE"
+        if restriction in ("FEMALE_ONLY", "MALE_ONLY"):
+            prov_gender = (provider.get("gender") or "").upper()
+            required = "FEMALE" if restriction == "FEMALE_ONLY" else "MALE"
+            if prov_gender != required:
+                r.reasons.append(R_GENDER)
 
         # Service capability
         offers = await self.db.provider_services.find_one({
@@ -255,7 +279,15 @@ class MatchingEngine:
         prov_ids = list({r["provider_id"] for r in rows})
         if not prov_ids:
             return []
-        provs = await self.db.providers.find({"id": {"$in": prov_ids}}, {"_id": 0}).to_list(500)
+        # Provider-side filter: KYC APPROVED + gender restriction (if any)
+        svc = await self.db.services.find_one({"id": svc_id}, {"_id": 0, "gender_restriction": 1})
+        restriction = (svc or {}).get("gender_restriction") or "NONE"
+        prov_query: dict = {"id": {"$in": prov_ids}, "kyc_status": "APPROVED"}
+        if restriction == "FEMALE_ONLY":
+            prov_query["gender"] = "FEMALE"
+        elif restriction == "MALE_ONLY":
+            prov_query["gender"] = "MALE"
+        provs = await self.db.providers.find(prov_query, {"_id": 0}).to_list(500)
         users = {u["id"]: u async for u in self.db.users.find(
             {"id": {"$in": [p["user_id"] for p in provs]}, "is_active": True}, {"_id": 0}
         )}

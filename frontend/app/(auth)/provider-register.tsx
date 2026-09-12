@@ -19,6 +19,7 @@ export default function ProviderRegister() {
     name: "", email: "", phone: "", password: "",
     business_name: "", bio: "", experience_years: "0", service_radius_km: "10",
     city: "", state: "", provider_type: "FULL_TIME" as "FULL_TIME" | "PART_TIME",
+    gender: "FEMALE" as "FEMALE" | "MALE" | "OTHER",
   });
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -85,6 +86,20 @@ export default function ProviderRegister() {
                 <Pressable key={t.k} style={[styles.typeChip, active && styles.typeChipActive]} onPress={() => setF({ ...f, provider_type: t.k as any })} testID={`prov-type-${t.k}`}>
                   <Text style={[styles.typeLabel, active && styles.typeLabelActive]}>{t.label}</Text>
                   <Text style={[styles.typeSub, active && styles.typeSubActive]}>{t.sub}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <Text style={styles.label}>Gender</Text>
+          <Text style={{ color: colors.muted, fontSize: 12, marginTop: -6, marginBottom: 4 }}>
+            Some personal services (Facial, Mehndi, Makeup) are matched to same-gender providers only.
+          </Text>
+          <View style={{ flexDirection: "row", gap: spacing.sm }}>
+            {(["FEMALE", "MALE", "OTHER"] as const).map((g) => {
+              const active = f.gender === g;
+              return (
+                <Pressable key={g} style={[styles.typeChip, active && styles.typeChipActive]} onPress={() => setF({ ...f, gender: g })} testID={`prov-gender-${g}`}>
+                  <Text style={[styles.typeLabel, active && styles.typeLabelActive]}>{g.charAt(0) + g.slice(1).toLowerCase()}</Text>
                 </Pressable>
               );
             })}

@@ -83,6 +83,12 @@ async def main():
                      headers={"Authorization": f"Bearer {prov_t}"},
                      json={"state": "AVAILABLE"})
 
+        # Approve provider KYC directly (matching engine now enforces KYC=APPROVED)
+        from motor.motor_asyncio import AsyncIOMotorClient
+        _db = AsyncIOMotorClient("mongodb://localhost:27017")["sandbac_db"]
+        _u = await _db.users.find_one({"email": prov_email})
+        await _db.providers.update_one({"user_id": _u["id"]}, {"$set": {"kyc_status": "APPROVED"}})
+
         # -- Customer creates an address + booking (paid flow)
         print("→ Customer creates address + booking")
         addr = (await c.post(f"{BASE}/addresses",

@@ -228,6 +228,16 @@ async def register(body: RegisterIn):
     })
     return await _issue_tokens(user_doc)
 
+class Gender(str, Enum):
+    MALE = "MALE"
+    FEMALE = "FEMALE"
+    OTHER = "OTHER"
+
+class GenderRestriction(str, Enum):
+    NONE = "NONE"
+    FEMALE_ONLY = "FEMALE_ONLY"
+    MALE_ONLY = "MALE_ONLY"
+
 class ProviderRegisterIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: EmailStr
@@ -236,6 +246,7 @@ class ProviderRegisterIn(BaseModel):
     business_name: Optional[str] = None
     bio: Optional[str] = None
     provider_type: ProviderType = ProviderType.FULL_TIME
+    gender: Gender = Field(default=Gender.FEMALE, description="Provider gender — required for gender-restricted services")
     experience_years: int = 0
     service_radius_km: int = 10
     city: Optional[str] = None
@@ -261,6 +272,7 @@ async def register_provider(body: ProviderRegisterIn):
         "bio": body.bio,
         "profile_image_url": None,
         "provider_type": body.provider_type.value,
+        "gender": body.gender.value,
         "experience_years": body.experience_years,
         "service_radius_km": body.service_radius_km,
         "base_city": body.city, "base_state": body.state,
@@ -422,6 +434,7 @@ class ServiceOut(BaseModel):
     image_url: Optional[str] = None
     starting_price_paise: int  # store as smallest currency unit
     duration_minutes: Optional[int] = None
+    gender_restriction: GenderRestriction = GenderRestriction.NONE
     is_active: bool = True
 
 @api.get("/services", response_model=List[ServiceOut])
@@ -658,17 +671,22 @@ ASSIGNMENT_TTL_SECONDS = 120  # 2 min per offer
 
 async def offer_to_eligible_providers(booking: dict) -> None:
     """Create OFFERED BookingAssignment records for eligible providers.
-    Foundation only — advanced ranking will be added in Prompt 7."""
+    Foundation fallback (matcher is the primary path). Enforces KYC + gender rules."""
     svc_id = booking["service_id"]
-    # Eligible providers: offer the service, active user, not offline (for ASAP);
-    # for scheduled/later we still offer to all (working-schedule check comes in Prompt 7).
     is_asap = booking["booking_type"] == BookingType.ASAP.value
     offered_provider_ids = {d["provider_id"] async for d in db.provider_services.find(
         {"service_id": svc_id, "is_active": True}, {"provider_id": 1, "_id": 0})}
     if not offered_provider_ids:
         return
-    # Check user active + provider preference short-circuits list to just that provider
-    provs = await db.providers.find({"id": {"$in": list(offered_provider_ids)}}, {"_id": 0}).to_list(500)
+    # ---- Service-level gender restriction ----------------------------------
+    svc = await db.services.find_one({"id": svc_id}, {"_id": 0, "gender_restriction": 1})
+    restriction = (svc or {}).get("gender_restriction") or "NONE"
+    prov_query: dict = {"id": {"$in": list(offered_provider_ids)}, "kyc_status": "APPROVED"}
+    if restriction == "FEMALE_ONLY":
+        prov_query["gender"] = "FEMALE"
+    elif restriction == "MALE_ONLY":
+        prov_query["gender"] = "MALE"
+    provs = await db.providers.find(prov_query, {"_id": 0}).to_list(500)
     if booking.get("provider_preference_id"):
         provs = [p for p in provs if p["id"] == booking["provider_preference_id"]]
     users = {u["id"]: u async for u in db.users.find(
@@ -1015,6 +1033,7 @@ class ProviderOut(BaseModel):
     bio: Optional[str] = None
     profile_image_url: Optional[str] = None
     provider_type: ProviderType
+    gender: Optional[Gender] = None
     experience_years: int = 0
     service_radius_km: int = 10
     base_city: Optional[str] = None
@@ -1030,6 +1049,7 @@ class ProviderPatch(BaseModel):
     bio: Optional[str] = None
     profile_image_url: Optional[str] = None
     provider_type: Optional[ProviderType] = None
+    gender: Optional[Gender] = None
     experience_years: Optional[int] = None
     service_radius_km: Optional[int] = None
     base_city: Optional[str] = None
@@ -1290,6 +1310,16 @@ async def accept_request(bid: str, p=Depends(get_provider)):
     offers = await db.provider_services.find_one({"provider_id": p["id"], "service_id": booking["service_id"], "is_active": True})
     if not offers:
         raise HTTPException(403, "You don't offer this service")
+    # KYC gate — provider profile must be verified before accepting bookings
+    if p.get("kyc_status") != "APPROVED":
+        raise HTTPException(403, "Your profile is not yet verified. Complete KYC to accept bookings.")
+    # Service-level gender restriction gate
+    svc_doc = await db.services.find_one({"id": booking["service_id"]}, {"_id": 0, "gender_restriction": 1, "name": 1})
+    restriction = (svc_doc or {}).get("gender_restriction") or "NONE"
+    if restriction in ("FEMALE_ONLY", "MALE_ONLY"):
+        required = "FEMALE" if restriction == "FEMALE_ONLY" else "MALE"
+        if (p.get("gender") or "").upper() != required:
+            raise HTTPException(403, f"This service is reserved for {required.lower()} providers.")
     # Expire own stale assignments first
     await db.booking_assignments.update_many(
         {"provider_id": p["id"], "booking_id": bid, "status": AssignmentStatus.OFFERED.value, "expires_at": {"$lt": now_utc()}},
@@ -1715,6 +1745,7 @@ class ServiceIn(BaseModel):
     image_url: Optional[str] = None
     starting_price_paise: int
     duration_minutes: Optional[int] = None
+    gender_restriction: GenderRestriction = GenderRestriction.NONE
     is_active: bool = True
     allows_reference_image: bool = True
     allows_design_selection: bool = True
@@ -2030,19 +2061,19 @@ SEED_CATEGORIES = [
 ]
 
 SEED_SERVICES = [
-    # (cat_slug, name, slug, desc, start_paise, dur, image, popularity)
+    # (cat_slug, name, slug, desc, start_paise, dur, image, popularity, gender_restriction)
     ("beauty", "Face Glow", "face-glow", "Deep cleansing + brightening facial at your doorstep.", 29900, 60,
-     "https://images.unsplash.com/photo-1647004692483-c5d942fe1137?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 95),
+     "https://images.unsplash.com/photo-1647004692483-c5d942fe1137?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 95, "FEMALE_ONLY"),
     ("decoration", "Birthday Decoration", "birthday-decoration", "Balloon arches, foil banners, thematic setups.", 59900, 120,
-     "https://images.unsplash.com/photo-1504196606672-aef5c9cefc92?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 98),
+     "https://images.unsplash.com/photo-1504196606672-aef5c9cefc92?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 98, "NONE"),
     ("mehndi", "Mehndi", "mehndi", "Bridal, arabic, traditional & minimal henna designs.", 19900, 90,
-     "https://images.unsplash.com/photo-1732118400647-a81e3b37be87?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 92),
+     "https://images.unsplash.com/photo-1732118400647-a81e3b37be87?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 92, "FEMALE_ONLY"),
     ("makeup", "Party Makeup", "party-makeup", "Glam party makeup with premium products.", 79900, 90,
-     "https://images.unsplash.com/photo-1610047614301-13c63f00c032?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 90),
+     "https://images.unsplash.com/photo-1610047614301-13c63f00c032?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 90, "FEMALE_ONLY"),
     ("makeup", "Bridal Makeup", "bridal-makeup", "Complete bridal look with airbrush & HD makeup.", 499900, 240,
-     "https://images.unsplash.com/photo-1610047614301-13c63f00c032?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 88),
+     "https://images.unsplash.com/photo-1610047614301-13c63f00c032?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 88, "FEMALE_ONLY"),
     ("celebration", "Anniversary Decoration", "anniversary-decoration", "Romantic setups, candles, roses & personalisation.", 89900, 120,
-     "https://images.unsplash.com/photo-1612145463153-e97c1774fe2a?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 85),
+     "https://images.unsplash.com/photo-1612145463153-e97c1774fe2a?crop=entropy&cs=srgb&fm=jpg&q=85&w=800", 85, "NONE"),
 ]
 
 SEED_PACKAGES = {
@@ -2157,6 +2188,9 @@ async def create_indexes():
     await db.webhook_events.create_index([("gateway_event_id", 1)], unique=True)
     await db.webhook_events.create_index("processed")
     await db.provider_bank_details.create_index("provider_id", unique=True)
+    # Gender + KYC eligibility filters
+    await db.providers.create_index([("gender", 1), ("kyc_status", 1)])
+    await db.services.create_index("gender_restriction")
 
 async def seed_data():
     # cities
@@ -2181,19 +2215,35 @@ async def seed_data():
         })
     # services
     svc_by_slug = {}
-    for (cslug, name, slug, desc, price, dur, img, pop) in SEED_SERVICES:
+    for (cslug, name, slug, desc, price, dur, img, pop, gender_restriction) in SEED_SERVICES:
         existing = await db.services.find_one({"slug": slug})
         if existing:
             svc_by_slug[slug] = existing["id"]
+            # Backfill gender_restriction on already-seeded services if missing
+            if not existing.get("gender_restriction"):
+                await db.services.update_one(
+                    {"id": existing["id"]},
+                    {"$set": {"gender_restriction": gender_restriction, "updated_at": now_utc()}},
+                )
             continue
         sid = new_id()
         svc_by_slug[slug] = sid
         await db.services.insert_one({
             "id": sid, "slug": slug, "name": name, "description": desc,
             "category_id": cat_by_slug[cslug], "starting_price_paise": price,
-            "duration_minutes": dur, "image_url": img, "popularity": pop, "is_active": True,
+            "duration_minutes": dur, "image_url": img, "popularity": pop,
+            "gender_restriction": gender_restriction, "is_active": True,
             "created_at": now_utc(), "updated_at": now_utc(),
         })
+    # Backfill defaults on existing provider docs (gender/kyc)
+    await db.services.update_many(
+        {"gender_restriction": {"$exists": False}},
+        {"$set": {"gender_restriction": "NONE"}},
+    )
+    await db.providers.update_many(
+        {"gender": {"$exists": False}},
+        {"$set": {"gender": "FEMALE"}},   # safe default; providers can update in profile
+    )
     # packages
     for slug, pkgs in SEED_PACKAGES.items():
         sid = svc_by_slug.get(slug)
