@@ -17,6 +17,12 @@ from enum import Enum
 import os, uuid, logging, jwt, hashlib, secrets, json
 from matching import MatchingEngine
 from realtime import hub, render, NOTIFICATION_TEMPLATES
+from payments import (
+    build_router as build_payments_router,
+    PaymentService, EarningsService, RefundService, PayoutService,
+    CommissionService, WebhookService, PaymentEventBus,
+)
+from payments.gateway import get_gateway
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -33,6 +39,16 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "ChangeMe@Admin1")
 client = AsyncIOMotorClient(MONGO_URL, tz_aware=True)
 db = client[DB_NAME]
 matcher = MatchingEngine(db)
+
+# ---- Payments module wiring (Prompt 9) ----
+_gateway = get_gateway()
+commission_service = CommissionService(db)
+_payment_events = PaymentEventBus(db, hub=hub)
+earnings_service = EarningsService(db, commission_service, events=_payment_events)
+payout_service = PayoutService(db, earnings_service, events=_payment_events)
+payment_service = PaymentService(db, _gateway, events=_payment_events)
+refund_service = RefundService(db, _gateway, earnings_service, events=_payment_events)
+webhook_service = WebhookService(db, _gateway, payment_service, events=_payment_events)
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 DUMMY_HASH = pwd_ctx.hash("dummy-timing-hash-value")
@@ -1373,14 +1389,13 @@ async def transition_status(bid: str, body: BookingStatusIn, p=Depends(get_provi
     if body.status == BookingStatus.SERVICE_STARTED:
         await db.provider_availability.update_one({"provider_id": p["id"]}, {"$set": {"state": Availability.ON_SERVICE.value, "updated_at": now_utc()}})
     if body.status == BookingStatus.SERVICE_COMPLETED:
-        gross = b["price_paise"]
-        commission = int(gross * 0.15)
-        net = gross - commission
-        await db.provider_earnings.insert_one({
-            "id": new_id(), "provider_id": p["id"], "booking_id": bid,
-            "gross_paise": gross, "commission_paise": commission, "net_paise": net,
-            "status": "PENDING", "created_at": now_utc(),
-        })
+        # New: modular EarningsService (idempotent per booking, uses configurable commission).
+        try:
+            fresh_booking = await db.bookings.find_one({"id": bid}, {"_id": 0})
+            if fresh_booking:
+                await earnings_service.create_for_booking(fresh_booking)
+        except Exception as e:
+            log.exception("earnings create failed for %s: %s", bid, e)
         await db.providers.update_one({"id": p["id"]}, {"$inc": {"total_completed": 1}})
         await db.provider_availability.update_one({"provider_id": p["id"]}, {"$set": {"state": Availability.AVAILABLE.value, "updated_at": now_utc()}})
     cust = await db.customers.find_one({"id": b["customer_id"]}, {"user_id": 1})
@@ -2126,6 +2141,29 @@ async def create_indexes():
     await db.booking_assignments.create_index([("booking_id", 1), ("status", 1)])
     await db.bookings.create_index([("customer_id_user", 1), ("idempotency_key", 1)])
     await db.notifications.create_index([("user_id", 1), ("event_id", 1)])
+    # ---- Payments (Prompt 9) ----
+    await db.payments.create_index("booking_id")
+    await db.payments.create_index([("customer_user_id", 1), ("created_at", -1)])
+    await db.payments.create_index([("gateway_order_id", 1)], unique=True, sparse=True)
+    await db.payments.create_index("state")
+    await db.payment_attempts.create_index([("payment_id", 1), ("attempt_no", 1)])
+    await db.payment_attempts.create_index("booking_id")
+    await db.payment_attempts.create_index([("gateway_order_id", 1)], sparse=True)
+    await db.refunds.create_index("payment_id")
+    await db.refunds.create_index("booking_id")
+    await db.refunds.create_index("state")
+    await db.refunds.create_index([("gateway_refund_id", 1)], unique=True, sparse=True)
+    await db.earnings.create_index([("booking_id", 1), ("provider_id", 1)], unique=True)
+    await db.earnings.create_index([("provider_id", 1), ("state", 1)])
+    await db.earnings.create_index("state")
+    await db.earning_adjustments.create_index("earning_id")
+    await db.earning_adjustments.create_index("booking_id")
+    await db.payouts.create_index([("provider_id", 1), ("state", 1)])
+    await db.payouts.create_index("state")
+    await db.commission_config.create_index([("scope", 1), ("scope_id", 1)], unique=True)
+    await db.webhook_events.create_index([("gateway_event_id", 1)], unique=True)
+    await db.webhook_events.create_index("processed")
+    await db.provider_bank_details.create_index("provider_id", unique=True)
 
 async def seed_data():
     # cities
@@ -2214,6 +2252,17 @@ async def on_shutdown():
     client.close()
 
 app.include_router(api)
+
+# ---- Payments router (Prompt 9) ----
+_payments_router = build_payments_router(
+    db=db, gateway=_gateway,
+    payments=payment_service, commission=commission_service,
+    refunds=refund_service, earnings=earnings_service, payouts=payout_service,
+    webhooks=webhook_service, events=_payment_events,
+    current_user=current_user, role_enum=Role,
+)
+app.include_router(_payments_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=False,
