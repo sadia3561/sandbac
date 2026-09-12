@@ -4,7 +4,7 @@ Services At Your Need Doorstep - Beauty And Celebration
 Modular architecture: auth, users, locations, categories, services, packages,
 providers/portfolio, designs, addresses, bookings, custom requests, notifications, reviews.
 """
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, status, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -14,8 +14,9 @@ from typing import List, Optional, Literal, Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from enum import Enum
-import os, uuid, logging, jwt, hashlib, secrets
+import os, uuid, logging, jwt, hashlib, secrets, json
 from matching import MatchingEngine
+from realtime import hub, render, NOTIFICATION_TEMPLATES
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -750,6 +751,9 @@ async def cancel_booking(bid: str, body: CancelIn | None = None, user=Depends(cu
                 "message": f"{b['service_name']} booking was cancelled. Reason: {reason}",
                 "booking_id": bid, "read": False, "created_at": now_utc(),
             })
+            try: await hub.emit(prov["user_id"], "booking.cancelled.v1", {
+                "booking_id": bid, "reason": reason, "ts": now_utc().isoformat()})
+            except Exception: pass
     b["status"] = BookingStatus.CANCELLED.value
     return b
 
@@ -820,8 +824,95 @@ async def admin_matching_debug(bid: str, admin=Depends(require_role(Role.ADMIN))
 
 
 # ============================================================================
-# NOTIFICATIONS
+# NOTIFICATIONS + REALTIME
 # ============================================================================
+async def notify(
+    user_id: str,
+    event_type: str,
+    data: dict,
+    booking_id: str | None = None,
+    event_id: str | None = None,
+) -> dict | None:
+    """Create an in-app notification (idempotent by `event_id` when supplied) and
+    emit a realtime event over WebSocket. Never raises — failure isolation."""
+    try:
+        title, body = render(event_type, data)
+        # Idempotency: if event_id is provided, skip duplicates
+        if event_id:
+            existing = await db.notifications.find_one({"event_id": event_id, "user_id": user_id})
+            if existing:
+                return None
+        doc = {
+            "id": new_id(),
+            "user_id": user_id,
+            "type": event_type,
+            "title": title,
+            "message": body,
+            "booking_id": booking_id,
+            "read": False,
+            "event_id": event_id,
+            "metadata": {k: v for k, v in data.items() if k not in ("password", "otp", "token")},
+            "created_at": now_utc(),
+        }
+        await db.notifications.insert_one(doc)
+        # Realtime emit (fire-and-forget; hub is failure-safe)
+        payload = {"notification": {k: v for k, v in doc.items() if k != "_id"},
+                    "ts": doc["created_at"].isoformat()}
+        try: await hub.emit(user_id, event_type, payload)
+        except Exception: pass
+        # Also emit a generic "notification" for badges/toasts
+        try: await hub.emit(user_id, "notification.created.v1", payload)
+        except Exception: pass
+        doc.pop("_id", None)
+        return doc
+    except Exception as e:
+        log.exception("notify failed: %s", e)
+        return None
+
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
+    # Authenticate via JWT before accepting
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        if claims.get("type") != "access":
+            await websocket.close(code=4401); return
+        user_id = claims["sub"]
+    except Exception:
+        await websocket.close(code=4401); return
+    user = await db.users.find_one({"id": user_id, "is_active": True}, {"_id": 0, "id": 1, "role": 1})
+    if not user:
+        await websocket.close(code=4401); return
+    await websocket.accept()
+    await hub.join(user_id, websocket)
+    try:
+        # Send hello for client-side ack
+        await websocket.send_text(json.dumps({"event": "hello.v1", "payload": {"user_id": user_id, "role": user["role"]}}))
+        while True:
+            # Keep alive; the server does not require inbound messages, but we drain any pings.
+            _ = await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning("ws error: %s", e)
+    finally:
+        await hub.leave(user_id, websocket)
+
+
+# ---------- Notification REST ----------
+@api.get("/notifications/unread-count")
+async def unread_count(user=Depends(current_user)):
+    n = await db.notifications.count_documents({"user_id": user["id"], "read": False})
+    return {"unread": n}
+
+@api.patch("/notifications/read-all")
+async def mark_all_read(user=Depends(current_user)):
+    r = await db.notifications.update_many({"user_id": user["id"], "read": False},
+                                              {"$set": {"read": True, "read_at": now_utc()}})
+    return {"ok": True, "updated": r.modified_count}
+
+
+
 class NotificationOut(BaseModel):
     id: str
     user_id: str
@@ -833,13 +924,17 @@ class NotificationOut(BaseModel):
     created_at: datetime
 
 @api.get("/notifications", response_model=List[NotificationOut])
-async def list_notifications(user=Depends(current_user)):
-    items = await db.notifications.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+async def list_notifications(skip: int = 0, limit: int = 30, unread_only: bool = False, user=Depends(current_user)):
+    q: dict = {"user_id": user["id"]}
+    if unread_only:
+        q["read"] = False
+    items = await db.notifications.find(q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(min(limit, 100)).to_list(limit)
     return items
 
 @api.post("/notifications/{nid}/read")
 async def mark_read(nid: str, user=Depends(current_user)):
-    await db.notifications.update_one({"id": nid, "user_id": user["id"]}, {"$set": {"read": True}})
+    await db.notifications.update_one({"id": nid, "user_id": user["id"]},
+                                        {"$set": {"read": True, "read_at": now_utc()}})
     return {"ok": True}
 
 # ============================================================================
@@ -1221,11 +1316,16 @@ async def accept_request(bid: str, p=Depends(get_provider)):
     cust = await db.customers.find_one({"id": b["customer_id"]}, {"user_id": 1})
     if cust:
         await db.notifications.insert_one({
-            "id": new_id(), "user_id": cust["user_id"], "type": "BOOKING_ACCEPTED",
-            "title": "Provider accepted your booking",
+            "id": new_id(), "user_id": cust["user_id"], "type": "PROVIDER_ACCEPTED",
+            "title": "Provider confirmed",
             "message": f"{p.get('business_name')} accepted your {b['service_name']} booking.",
             "booking_id": bid, "read": False, "created_at": now_utc(),
         })
+        # Realtime → customer
+        try: await hub.emit(cust["user_id"], "booking.status.updated.v1", {
+            "booking_id": bid, "old_status": booking["status"], "new_status": BookingStatus.PROVIDER_ACCEPTED.value,
+            "provider_name": p.get("business_name"), "ts": now_utc().isoformat()})
+        except Exception: pass
     return b
 
 class RejectIn(BaseModel):
@@ -1298,6 +1398,10 @@ async def transition_status(bid: str, body: BookingStatusIn, p=Depends(get_provi
                 "message": f"Your {b['service_name']} booking: {labels[body.status.value]}.",
                 "booking_id": bid, "read": False, "created_at": now_utc(),
             })
+            try: await hub.emit(cust["user_id"], "booking.status.updated.v1", {
+                "booking_id": bid, "old_status": b["status"], "new_status": body.status.value,
+                "ts": now_utc().isoformat()})
+            except Exception: pass
     fresh = await db.bookings.find_one({"id": bid}, {"_id": 0})
     return fresh
 
@@ -2021,6 +2125,7 @@ async def create_indexes():
     await db.booking_assignments.create_index([("provider_id", 1), ("status", 1)])
     await db.booking_assignments.create_index([("booking_id", 1), ("status", 1)])
     await db.bookings.create_index([("customer_id_user", 1), ("idempotency_key", 1)])
+    await db.notifications.create_index([("user_id", 1), ("event_id", 1)])
 
 async def seed_data():
     # cities

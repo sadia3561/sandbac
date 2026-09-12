@@ -26,8 +26,17 @@ Untouched, still working. Customer: welcome / login / register / location onboar
 
 ## Deferred (per spec)
 - Payment gateway + automated payouts
-- Push notifications, WebSocket realtime (event hooks in place)
+- Push / Email / SMS providers (abstractions ready in `realtime.py` template registry — pluggable later)
 - Complex map tracking / AI recommendations / image similarity
+
+## Notifications + Realtime (this step) — `/app/backend/realtime.py`
+- **Native FastAPI WebSocket gateway** at `/api/ws?token=<jwt>` with JWT auth, per-user rooms, versioned event contracts (`hello.v1`, `booking.status.updated.v1`, `booking.cancelled.v1`, `provider.assignment.created.v1`, `notification.created.v1`).
+- **Failure-safe `Hub`** manager with join/leave/emit; dead sockets pruned automatically; hub failures never break the booking pipeline.
+- **`notify(user_id, event_type, data, event_id=…)` helper** — creates the DB notification, applies template, emits realtime. Idempotent when `event_id` is supplied (uniqueness enforced by `(user_id, event_id)` index).
+- **Template registry** with all 16+ notification types (BOOKING_CREATED → PORTFOLIO_APPROVED → ADMIN_ANNOUNCEMENT).
+- Booking events integrated at every transition: create → offer (matching layer emits to provider), accept, on-the-way/arrived/started/completed, cancel (customer + assigned provider).
+- New REST: `GET /api/notifications?skip=&limit=&unread_only=`, `GET /api/notifications/unread-count`, `PATCH /api/notifications/read-all`, `POST /api/notifications/{id}/read` (records `read_at`).
+- **Frontend**: `useRealtime()` hook mounted globally in `_layout.tsx` — connects with JWT, invalidates react-query caches on relevant events, auto-reconnects with exponential backoff (max 20 s). REST remains source of truth; WS only nudges.
 
 ## Smart Matching & Dispatch Engine (this step) — `/app/backend/matching.py`
 Three modular services on top of the booking engine:

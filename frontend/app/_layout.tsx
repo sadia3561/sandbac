@@ -8,6 +8,7 @@ import { ErrorBoundary } from "@/src/components/error-boundary";
 import { queryClient } from "@/src/query-client";
 import { AuthProvider, useAuth } from "@/src/context/AuthContext";
 import { LocationProvider, useLocation } from "@/src/context/LocationContext";
+import { useRealtime } from "@/src/realtime/useRealtime";
 
 LogBox.ignoreAllLogs(true);
 
@@ -16,6 +17,7 @@ function Gate() {
   const { location, ready: locReady } = useLocation();
   const router = useRouter();
   const segments = useSegments();
+  useRealtime();
 
   useEffect(() => {
     if (!authReady || !locReady) return;

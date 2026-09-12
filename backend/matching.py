@@ -309,11 +309,22 @@ class MatchingEngine:
             await self.db.booking_assignments.insert_one(doc)
             # In-app notification to the provider (real-time will land in Prompt 8)
             await self.db.notifications.insert_one({
-                "id": str(uuid.uuid4()), "user_id": provider["user_id"], "type": "NEW_REQUEST",
+                "id": str(uuid.uuid4()), "user_id": provider["user_id"], "type": "PROVIDER_REQUEST_RECEIVED",
                 "title": "New service request",
                 "message": f"{booking['service_name']} • {booking['package_name']} • score {r['score']:.1f}",
                 "booking_id": booking["id"], "read": False, "created_at": now_utc(),
             })
+            # Realtime notify (best-effort; the module lazily imports to avoid a cycle)
+            try:
+                from realtime import hub as _hub
+                await _hub.emit(provider["user_id"], "provider.assignment.created.v1", {
+                    "booking_id": booking["id"], "service_name": booking["service_name"],
+                    "package_name": booking["package_name"], "score": r["score"],
+                    "distance_km": r["distance_km"], "expires_at": expires_at.isoformat(),
+                    "ts": now_utc().isoformat(),
+                })
+            except Exception:
+                pass
             return doc
         # No candidates left
         return None
