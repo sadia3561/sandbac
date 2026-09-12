@@ -112,7 +112,17 @@ export default function BookingDetail() {
         ) : null}
 
         {!isTerminal && b.data.status !== "SERVICE_COMPLETED" ? (
-          <Button label="Cancel booking" variant="ghost" onPress={onCancel} testID="cancel-booking-btn" />
+          <>
+            {b.data.payment_status !== "SUCCESS" && b.data.payment_status !== "REFUNDED" && b.data.payment_status !== "PARTIALLY_REFUNDED" ? (
+              <Button label={`Pay ${rupees(b.data.price_paise)} now`} variant="primary" onPress={() => router.push(`/checkout/${b.data.id}`)} testID="pay-now-btn" />
+            ) : (
+              <View style={[styles.card, { borderColor: colors.success }]}>
+                <Text style={{ color: colors.success, fontWeight: font.weightSemibold }}>✓ Payment received</Text>
+                <Text style={styles.sub}>Status: {b.data.payment_status.replaceAll("_", " ")}</Text>
+              </View>
+            )}
+            <Button label="Cancel booking" variant="ghost" onPress={onCancel} testID="cancel-booking-btn" />
+          </>
         ) : null}
       </ScrollView>
     </View>

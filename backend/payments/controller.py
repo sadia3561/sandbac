@@ -348,8 +348,29 @@ def build_router(
             percent=body.percent, fixed_paise=body.fixed_paise, is_active=body.is_active,
         )
 
+    # =====================================================================
+    # MOCK-ONLY: simulate gateway "checkout success" for the mobile app.
+    # Guarded to non-production environments; real gateways NEVER need this.
+    # =====================================================================
+    @r.post("/payments/mock/pay")
+    async def mock_pay(body: dict, user=Depends(current_user)):
+        if C.GATEWAY_ENVIRONMENT == "production" or gateway.name != "mock":
+            raise HTTPException(404, "Not available")
+        pid = body.get("payment_id")
+        goid = body.get("gateway_order_id")
+        if not pid or not goid:
+            raise HTTPException(400, "payment_id and gateway_order_id required")
+        p = await db.payments.find_one({"id": pid, "customer_user_id": user["id"]}, {"_id": 0})
+        if not p:
+            raise HTTPException(404, "payment not found")
+        if p.get("gateway_order_id") != goid:
+            raise HTTPException(400, "order mismatch")
+        # Only the mock gateway exposes compute_signature (typed via duck-typing)
+        gpid = f"pay_mock_{goid[-10:]}"
+        try:
+            sig = gateway.compute_signature(goid, gpid)  # type: ignore[attr-defined]
+        except Exception:
+            raise HTTPException(500, "signature generation failed")
+        return {"gateway_payment_id": gpid, "gateway_signature": sig}
+
     return r
-
-
-# Public API for backward-compatible imports  (server.py uses build_router directly)
-router = None  # populated at build time

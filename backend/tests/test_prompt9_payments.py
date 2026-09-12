@@ -237,6 +237,7 @@ async def main():
         rfnd = (await c.post(f"{BASE}/payments/{order2['payment_id']}/refund",
                               headers={"Authorization": f"Bearer {cust_t}"},
                               json={"amount_paise": None, "reason": "Test refund"})).json()
+        print("   refund response:", rfnd)
         assert rfnd["state"] == "COMPLETED", rfnd
         assert rfnd["approved_amount_paise"] == bk2["price_paise"]
         print(f"   OK — refund state={rfnd['state']} amount={rfnd['approved_amount_paise']}")

@@ -85,7 +85,7 @@ export default function BookingNew() {
         reference_note: refNote || undefined,
         notes: notes || undefined,
       });
-      router.replace(`/booking/${b.id}`);
+      router.replace(`/checkout/${b.id}`);
     } catch (e: any) { setErr(e?.message || "Booking failed"); }
     finally { setBusy(false); }
   };

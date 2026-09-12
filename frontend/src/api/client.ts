@@ -191,6 +191,59 @@ export const api = {
   adminEarnings: () => apiFetch<any[]>("/api/admin/earnings"),
   adminAuditLogs: () => apiFetch<any[]>("/api/admin/audit-logs"),
   adminAnnounce: (b: any) => apiFetch<any>("/api/admin/announcements", { method: "POST", body: JSON.stringify(b) }),
+
+  // ---------- PAYMENTS (Prompt 9) ----------
+  paymentConfig: () => apiFetch<{ gateway: string; environment: string; key_id: string; currency: string }>("/api/payments/config"),
+  createPaymentOrder: (booking_id: string) =>
+    apiFetch<any>("/api/payments/order", { method: "POST", body: JSON.stringify({ booking_id }) }),
+  verifyPayment: (payment_id: string, gateway_order_id: string, gateway_payment_id: string, gateway_signature: string) =>
+    apiFetch<any>("/api/payments/verify", {
+      method: "POST",
+      body: JSON.stringify({ payment_id, gateway_order_id, gateway_payment_id, gateway_signature }),
+    }),
+  cancelPaymentAttempt: (payment_id: string, gateway_order_id: string, reason?: string) =>
+    apiFetch<any>("/api/payments/attempt/cancel", {
+      method: "POST",
+      body: JSON.stringify({ booking_id: "", payment_id, gateway_order_id, reason }),
+    }),
+  payment: (payment_id: string) => apiFetch<any>(`/api/payments/${payment_id}`),
+  customerPayments: () => apiFetch<any[]>("/api/customer/payments"),
+  bookingPayment: (booking_id: string) => apiFetch<any>(`/api/bookings/${booking_id}/payment`),
+  bookingPaymentAttempts: (booking_id: string) => apiFetch<any[]>(`/api/bookings/${booking_id}/payment/attempts`),
+  refundPayment: (payment_id: string, amount_paise?: number | null, reason?: string) =>
+    apiFetch<any>(`/api/payments/${payment_id}/refund`, {
+      method: "POST",
+      body: JSON.stringify({ amount_paise: amount_paise ?? null, reason }),
+    }),
+  bookingRefunds: (booking_id: string) => apiFetch<any[]>(`/api/bookings/${booking_id}/refunds`),
+  providerEarningsV2: () => apiFetch<any[]>("/api/provider/earnings"),
+  providerEarningsSummaryV2: () => apiFetch<any>("/api/provider/earnings/summary/v2"),
+  providerBankDetails: () => apiFetch<any>("/api/provider/bank-details"),
+  saveBankDetails: (b: any) => apiFetch<any>("/api/provider/bank-details", { method: "PUT", body: JSON.stringify(b) }),
+  requestPayout: (earning_ids?: string[] | null) =>
+    apiFetch<any>("/api/provider/payouts/request", {
+      method: "POST", body: JSON.stringify({ earning_ids: earning_ids ?? null }),
+    }),
+  providerPayouts: () => apiFetch<any[]>("/api/provider/payouts"),
+  adminPaymentsDashboard: () => apiFetch<any>("/api/admin/payments/dashboard"),
+  adminPayments: (state?: string) => apiFetch<any[]>(`/api/admin/payments${state ? "?state=" + state : ""}`),
+  adminRefunds: (state?: string) => apiFetch<any[]>(`/api/admin/refunds${state ? "?state=" + state : ""}`),
+  adminPayouts: (state?: string) => apiFetch<any[]>(`/api/admin/payouts${state ? "?state=" + state : ""}`),
+  adminPayoutMarkPaid: (id: string, gateway_payout_id?: string) =>
+    apiFetch<any>(`/api/admin/payouts/${id}/mark-paid`, {
+      method: "POST", body: JSON.stringify({ gateway_payout_id: gateway_payout_id ?? null }),
+    }),
+  adminPayoutMarkFailed: (id: string, reason: string) =>
+    apiFetch<any>(`/api/admin/payouts/${id}/mark-failed`, {
+      method: "POST", body: JSON.stringify({ reason }),
+    }),
+  adminCommissionConfig: () => apiFetch<any[]>("/api/admin/commission-config"),
+  adminUpsertCommission: (b: any) => apiFetch<any>("/api/admin/commission-config", { method: "POST", body: JSON.stringify(b) }),
+  // Test-only: simulate a successful mock gateway checkout
+  mockPay: (payment_id: string, gateway_order_id: string) =>
+    apiFetch<{ gateway_payment_id: string; gateway_signature: string }>("/api/payments/mock/pay", {
+      method: "POST", body: JSON.stringify({ payment_id, gateway_order_id }),
+    }),
 };
 
 export const API_BASE = BASE;

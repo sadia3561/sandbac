@@ -177,7 +177,7 @@ class PaymentAttemptOut(BaseModel):
 
 
 class RefundRequestIn(BaseModel):
-    payment_id: str
+    payment_id: Optional[str] = None   # URL param authoritative
     amount_paise: Optional[int] = Field(default=None, ge=1)  # None = full refund
     reason: Optional[str] = None
 

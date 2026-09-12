@@ -15,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from enum import Enum
 import os, uuid, logging, jwt, hashlib, secrets, json
+
+# Load env FIRST so downstream module-level env reads (payments/constants.py) see values
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
 from matching import MatchingEngine
 from realtime import hub, render, NOTIFICATION_TEMPLATES
 from payments import (
@@ -23,9 +28,6 @@ from payments import (
     CommissionService, WebhookService, PaymentEventBus,
 )
 from payments.gateway import get_gateway
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
@@ -1420,7 +1422,7 @@ async def transition_status(bid: str, body: BookingStatusIn, p=Depends(get_provi
     fresh = await db.bookings.find_one({"id": bid}, {"_id": 0})
     return fresh
 
-# ---- Earnings ----
+# ---- Earnings (legacy summary — reads new `earnings` collection) ----
 class EarningSummary(BaseModel):
     today_paise: int
     week_paise: int
@@ -1430,15 +1432,6 @@ class EarningSummary(BaseModel):
     pending_payout_paise: int
     paid_payout_paise: int
 
-class EarningItem(BaseModel):
-    id: str
-    booking_id: str
-    gross_paise: int
-    commission_paise: int
-    net_paise: int
-    status: str
-    created_at: datetime
-
 @api.get("/provider/earnings/summary", response_model=EarningSummary)
 async def earnings_summary(p=Depends(get_provider)):
     now = now_utc()
@@ -1446,21 +1439,24 @@ async def earnings_summary(p=Depends(get_provider)):
     week0 = day0 - timedelta(days=day0.weekday())
     month0 = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     def agg(dt): return [{"$match": {"provider_id": p["id"], "created_at": {"$gte": dt}}},
-                          {"$group": {"_id": None, "s": {"$sum": "$net_paise"}}}]
+                          {"$group": {"_id": None, "s": {"$sum": "$final_amount_paise"}}}]
     async def _sum(pipeline):
-        r = await db.provider_earnings.aggregate(pipeline).to_list(1)
+        r = await db.earnings.aggregate(pipeline).to_list(1)
         return int(r[0]["s"]) if r else 0
     today = await _sum(agg(day0))
     week = await _sum(agg(week0))
     month = await _sum(agg(month0))
-    total_pipe = [{"$match": {"provider_id": p["id"]}}, {"$group": {"_id": None, "s": {"$sum": "$net_paise"}, "c": {"$sum": 1}}}]
-    t = await db.provider_earnings.aggregate(total_pipe).to_list(1)
+    total_pipe = [{"$match": {"provider_id": p["id"]}},
+                   {"$group": {"_id": None, "s": {"$sum": "$final_amount_paise"}, "c": {"$sum": 1}}}]
+    t = await db.earnings.aggregate(total_pipe).to_list(1)
     total = int(t[0]["s"]) if t else 0
     completed = int(t[0]["c"]) if t else 0
-    pending_pipe = [{"$match": {"provider_id": p["id"], "status": "PENDING"}}, {"$group": {"_id": None, "s": {"$sum": "$net_paise"}}}]
-    paid_pipe = [{"$match": {"provider_id": p["id"], "status": "PAID"}}, {"$group": {"_id": None, "s": {"$sum": "$net_paise"}}}]
-    pen = await db.provider_earnings.aggregate(pending_pipe).to_list(1)
-    paid = await db.provider_earnings.aggregate(paid_pipe).to_list(1)
+    pending_pipe = [{"$match": {"provider_id": p["id"], "state": {"$in": ["PENDING", "AVAILABLE"]}}},
+                     {"$group": {"_id": None, "s": {"$sum": "$final_amount_paise"}}}]
+    paid_pipe = [{"$match": {"provider_id": p["id"], "state": "PAID"}},
+                  {"$group": {"_id": None, "s": {"$sum": "$final_amount_paise"}}}]
+    pen = await db.earnings.aggregate(pending_pipe).to_list(1)
+    paid = await db.earnings.aggregate(paid_pipe).to_list(1)
     return EarningSummary(
         today_paise=today, week_paise=week, month_paise=month, total_paise=total,
         completed_count=completed,
@@ -1468,10 +1464,7 @@ async def earnings_summary(p=Depends(get_provider)):
         paid_payout_paise=int(paid[0]["s"]) if paid else 0,
     )
 
-@api.get("/provider/earnings", response_model=List[EarningItem])
-async def earnings_list(p=Depends(get_provider)):
-    items = await db.provider_earnings.find({"provider_id": p["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
-    return items
+# NOTE: /provider/earnings list endpoint is served by the payments router (Prompt 9).
 
 # ---- Reviews ----
 @api.get("/provider/reviews")
@@ -1538,7 +1531,7 @@ async def admin_dashboard(_=Depends(admin_only())):
         "bookings_cancelled": await _cnt("bookings", {"status": BookingStatus.CANCELLED.value}),
         "portfolio_pending": await _cnt("designs", {"approval_status": "PENDING_REVIEW"}),
     }
-    rev = await db.provider_earnings.aggregate([{"$group": {"_id": None, "gross": {"$sum": "$gross_paise"}, "commission": {"$sum": "$commission_paise"}, "pending": {"$sum": {"$cond": [{"$eq": ["$status", "PENDING"]}, "$net_paise", 0]}}}}]).to_list(1)
+    rev = await db.earnings.aggregate([{"$group": {"_id": None, "gross": {"$sum": "$gross_amount_paise"}, "commission": {"$sum": "$commission_amount_paise"}, "pending": {"$sum": {"$cond": [{"$in": ["$state", ["PENDING", "AVAILABLE"]]}, "$final_amount_paise", 0]}}}}]).to_list(1)
     stats["revenue_paise"] = int(rev[0]["gross"]) if rev else 0
     stats["platform_paise"] = int(rev[0]["commission"]) if rev else 0
     stats["pending_payouts_paise"] = int(rev[0]["pending"]) if rev else 0
@@ -1972,7 +1965,7 @@ async def admin_delete_coupon(cid: str, admin=Depends(admin_only())):
 
 @api.get("/admin/earnings")
 async def admin_earnings(_=Depends(admin_only())):
-    items = await db.provider_earnings.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    items = await db.earnings.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
     prov_map = {p["id"]: p.get("business_name") async for p in db.providers.find({}, {"_id": 0, "id": 1, "business_name": 1})}
     for e in items:
         e["provider_name"] = prov_map.get(e.get("provider_id"))
